@@ -1,0 +1,220 @@
+var Region1= ee.FeatureCollection('projects/ee-rajendrakumar93/assets/acz_b_I_Region1');
+
+// 3. Center the map on the region of interest (ROI)
+Map.centerObject(Region1, 6);
+Map.addLayer(Region1, {}, "study area");
+
+// 4. Load the biomass carbon density dataset, select the above-ground biomass (AGB) band, and convert it to an integer
+var agbDataset = ee.ImageCollection("NASA/ORNL/biomass_carbon_density/v1")
+  .select('agb').first().toInt();
+print(agbDataset);
+
+// 5. Define the time period for the analysis
+var startYear = '2010', endYear = '2018';
+
+// 6. Load the MODIS NDVI and EVI dataset, filter by date and month, scale the values, and calculate the median
+var vegetationIndices = ee.ImageCollection("MODIS/061/MOD13Q1")
+  .select('NDVI', 'EVI')
+  .filterDate(startYear, endYear)
+  .filter(ee.Filter.calendarRange(1, 12, 'month'))
+  .map(function(image) {
+    return image.multiply(0.0001)  // apply scale factor for both NDVI, EVI
+      .copyProperties(image, image.propertyNames());
+  }).median();
+print(vegetationIndices);
+
+// 7. Load the MODIS LAI and FPAR dataset, filter by date and month, scale the values, and calculate the median
+var laiFparDataset = ee.ImageCollection("MODIS/061/MOD15A2H")
+  .select('Lai_500m', 'Fpar_500m')
+  .filterDate(startYear, endYear)
+  .filter(ee.Filter.calendarRange(1, 12, 'month'))
+  .map(function(image) {
+    var lai = image.select('Lai_500m').multiply(0.1);
+    var fpar = image.select('Fpar_500m').multiply(0.01);
+    return lai.addBands(fpar)
+      .copyProperties(image, image.propertyNames());
+  }).median();
+
+// 10. Load the MODIS Land Cover dataset and select the land cover type band
+var landCover = ee.ImageCollection("MODIS/061/MCD12Q1")
+  .select('LC_Type1').mode();
+
+// 11. Load the DEM dataset for elevation data
+var elevation = ee.Terrain.products(ee.Image("USGS/GTOPO30").select('elevation'));
+
+// 12. Combine all the datasets (AGB, NDVI, LAI, Land Cover) into a single image
+var combinedDataset = ee.Image.cat([agbDataset, vegetationIndices, laiFparDataset, landCover]);
+print(combinedDataset);
+
+// 13. Create a training dataset by sampling the combined image within the ROI
+var trainingData = combinedDataset.stratifiedSample({
+  numPoints: 100, 
+  classBand: 'agb', 
+  region: Region1,       
+  scale: 500
+});
+
+// 14. Train a Random Forest model using the training data
+var randomForestModel = ee.Classifier.smileRandomForest(80).train({
+  features: trainingData, 
+  classProperty: 'agb', 
+  inputProperties: combinedDataset.bandNames()
+}).setOutputMode('REGRESSION');
+
+// 15. Define the predictors by removing the AGB band from the dataset
+var predictors = combinedDataset.bandNames().remove('agb');
+
+// 16. Apply the trained model to predict AGB and rename the output band
+var agbPrediction = combinedDataset.select(predictors).classify(randomForestModel).rename('predicted_agb');
+
+// 17. Calculate the Pearson correlation between the predicted and original AGB
+var correlation = agbPrediction.addBands(combinedDataset.select('agb')).reduceRegion({
+  reducer: ee.Reducer.pearsonsCorrelation(), 
+  geometry:Region1 , 
+  scale: 10000
+});
+print(correlation);
+
+// 18. Calculate the R-squared value from the Pearson correlation
+var rSquared = ee.Number(correlation.values().get(0)).pow(2);
+print('R-squared:', rSquared);
+
+// 19. Calculate RMSE
+var squaredDifferences = agbPrediction.subtract(combinedDataset.select('agb')).pow(2);
+var meanSquaredDifferences = squaredDifferences.reduceRegion({
+  reducer: ee.Reducer.mean(),
+  geometry:Region1 ,
+  scale: 10000
+}).get('predicted_agb');
+var rmse = ee.Number(meanSquaredDifferences).sqrt();
+print('RMSE:', rmse);
+
+// 20. Calculate Mean Square Error (MSE)
+var mse = squaredDifferences.reduceRegion({
+  reducer: ee.Reducer.mean(),
+  geometry: Region1,
+  scale: 10000
+}).get('predicted_agb');
+print('MSE:', mse);
+
+// 21. Calculate the average biomass value
+var meanAgb = agbPrediction.reduceRegion({
+  reducer: ee.Reducer.mean(),
+  geometry: Region1,
+  scale: 10000
+}).get('predicted_agb');
+print('Mean AGB:', meanAgb);
+
+// 22. Prediction for a dynamic prediction year
+var predictionYear = '2020';  // Set this to the desired prediction year
+
+// Load and preprocess the NDVI and EVI data for the prediction year
+var vegetationIndicesPredictionYear = ee.ImageCollection("MODIS/061/MOD13Q1")
+  .select('NDVI', 'EVI')
+  .filterDate(predictionYear + '-01-01', predictionYear + '-12-31')
+  .map(function(image) {
+    return image.multiply(0.0001)
+      .copyProperties(image, image.propertyNames());
+  }).median();
+
+// Load and preprocess the LAI and FPAR data for the prediction year
+var laiFparPredictionYear = ee.ImageCollection("MODIS/061/MOD15A2H")
+  .select('Lai_500m', 'Fpar_500m')
+  .filterDate(predictionYear + '-01-01', predictionYear + '-12-31')
+  .map(function(image) {
+    var lai = image.select('Lai_500m').multiply(0.1);
+    var fpar = image.select('Fpar_500m').multiply(0.01);
+    return lai.addBands(fpar)
+      .copyProperties(image, image.propertyNames());
+  }).median();
+
+// Combine the datasets for the prediction year
+var combinedDatasetPredictionYear = ee.Image.cat([vegetationIndicesPredictionYear, laiFparPredictionYear, landCover]);
+
+// Predict the AGB for the prediction year using the trained model
+var agbPredictionYear = combinedDatasetPredictionYear.classify(randomForestModel).rename('predicted_agb_' + predictionYear);
+
+// Calculate the mean predicted AGB value for the prediction year
+var meanAgbPredictionYear = agbPredictionYear.reduceRegion({
+  reducer: ee.Reducer.mean(),
+  geometry: Region1,
+  scale: 500,
+  maxPixels: 1e13
+}).get('predicted_agb_' + predictionYear);
+
+// Print the mean AGB value for the prediction year
+print('Mean predicted AGB for the year ' + predictionYear + ':', meanAgbPredictionYear);
+
+// Export the predicted AGB value for the prediction year along with other statistics
+var statsFeaturePredictionYear = ee.Feature(null, {
+  'startYear': startYear,
+  'endYear': endYear,
+  'predictedYear': predictionYear,
+  'Mean_Predicted_AGB': meanAgbPredictionYear,
+  'RMSE': rmse,
+  'MSE': mse,
+  'Mean Agb': meanAgb,
+  'R-squared': rSquared,
+  'Pearson_Correlation': correlation.values().get(0),
+  'p-value': ee.Number(0.05)  // Assuming a default p-value for demonstration
+});
+
+var statsCollectionPredictionYear = ee.FeatureCollection([statsFeaturePredictionYear]);
+
+Export.table.toDrive({
+  collection: statsCollectionPredictionYear,
+  description: 'AGB_Statistics_with_Prediction_Year_' + predictionYear,
+  fileFormat: 'CSV'
+});
+
+Export.image.toDrive({
+  image: combinedDataset.select('agb').clip(Region1),
+  description: 'Original_AGB_R1_5',
+  scale: 500,
+  region: Region1,
+  fileFormat: 'GeoTIFF',
+  maxPixels: 1e13
+});
+
+// Export Predicted AGB layer to Google Drive
+Export.image.toDrive({
+  image: agbPrediction.clip(Region1),
+  description: 'Predicted_AGB_R1_5',
+  scale: 500,
+  region: Region1,
+  fileFormat: 'GeoTIFF',
+  maxPixels: 1e13
+});
+
+// Export NDVI and EVI layer to Google Drive
+Export.image.toDrive({
+  image: vegetationIndices.clip(Region1),
+  description: 'Vegetation_Indices_R1_5',
+  scale: 500,
+  region: Region1,
+  fileFormat: 'GeoTIFF',
+  maxPixels: 1e13
+});
+
+// Export LAI and FPAR layer to Google Drive
+Export.image.toDrive({
+  image: laiFparDataset.clip(Region1),
+  description: 'LAI_FPAR_R1_5',
+  scale: 500,
+  region: Region1,
+  fileFormat: 'GeoTIFF',
+  maxPixels: 1e13
+});
+
+
+
+// // Export DEM layer to Google Drive
+// Export.image.toDrive({
+//   image: elevation.clip(Region1),
+//   description: 'DEM_R1_2',
+//   scale: 500,
+//   region: Region1,
+//   fileFormat: 'GeoTIFF',
+//   maxPixels: 1e13
+// });
+

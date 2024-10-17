@@ -1,0 +1,38 @@
+// Define the region of interest using the shapefile
+var region = ee.FeatureCollection('projects/ee-rajendrakumar93/assets/acz_b_I_Region1');
+
+// Define the MODIS ImageCollection (MOD13Q1 for NDVI and EVI)
+var modis = ee.ImageCollection("MODIS/061/MOD13Q1")
+             .select(['NDVI', 'EVI'])  // Select NDVI and EVI bands
+             .filterBounds(region)     // Filter the data to the region of interest
+             .filterDate('2010-01-01', '2024-08-31');  // Date range
+
+// Define a function to calculate and scale NDVI and EVI, then add month and year as properties
+var scaleAndReduce = function(image) {
+  var date = ee.Date(image.get('system:time_start'));
+  var year = date.get('year');
+  var month = date.get('month');
+  
+  var scaledImage = image.multiply(0.0001).set('year', year).set('month', month);
+  
+  // Reduce the image to the mean value of the region
+  var reduced = scaledImage.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: region,
+    scale: 500,  // 500m scale for MODIS data
+    maxPixels: 1e13
+  });
+  
+  return ee.Feature(null, reduced.set('year', year).set('month', month));
+};
+
+// Apply the scaling and reduction function over the ImageCollection
+var results = modis.map(scaleAndReduce);
+
+// Convert the results to a FeatureCollection and print to CSV
+Export.table.toDrive({
+  collection: ee.FeatureCollection(results),
+  description: 'MODIS_NDVI_EVI_2010_2024',
+  fileFormat: 'CSV',
+  selectors: ['year', 'month', 'NDVI', 'EVI']
+});
